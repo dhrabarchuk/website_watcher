@@ -17,6 +17,8 @@
   - hourly failure percentages (last 24 hours)
 - Saves artifacts for failed attempts (HTML/screenshot).
 - Saves extra diagnostics JSON for timeout-style failures.
+- Optionally writes JSONL events and a machine-readable health summary file.
+- Can run a startup `--self-test` and exit.
 
 ## Output Files and Folders
 
@@ -24,9 +26,13 @@
   - Text event log.
 - `host_error/host_error_stats.csv`
   - Per-attempt CSV stats.
+- `host_error/health.json` (default path; configurable)
+  - Latest heartbeat/status snapshot for external monitors.
 - `host_error/`
   - Host-error artifacts (`*.png`, `*.html`)
   - Timeout diagnostics JSON (`*_timeout_diagnostics.json`)
+- Optional JSONL event stream (`--jsonl /path/events.jsonl`)
+  - One event object per attempt.
 - `failures/`
   - Non-host-error failure artifacts (`timeout`, `webdriver_error`, etc.).
 
@@ -61,6 +67,17 @@ When not in a TTY (redirected output, cron, etc.), it prints plain log lines ins
   - `current_url`, `title`, `document.readyState`
   - browser console logs
   - performance logs and parsed `Network.loadingFailed` events
+  - request/domain timing breakdown (slowest and failed requests)
+  - browser/chromedriver resource stats (CPU/RAM, best effort)
+
+## Observability Features
+
+- JSONL event output (`--jsonl`)
+  - Includes status, attempt number, load time, counts, failure percentages, and resource stats.
+- Health file output (`--health-file`)
+  - Updated each attempt with heartbeat, current status, summaries, consecutive failures, and resource stats.
+- Resource tracking
+  - Uses process-tree inspection to estimate Chrome/chromedriver CPU and RSS.
 
 ## Requirements
 
@@ -79,14 +96,32 @@ python3 watch.py --url https://example.com
 
 Options:
 
-- `-u, --url` (required): target URL (with or without scheme)
+- `-u, --url`: target URL (required unless `--self-test` is used)
 - `--pause` (default `5`): seconds between attempts
 - `--timeout` (default `60`): Selenium page-load timeout in seconds
+- `--jsonl`: optional JSONL event output path
+- `--health-file` (default `host_error/health.json`): health summary JSON output path
+- `--self-test`: run startup checks (driver + write paths) and exit
 
 Example:
 
 ```bash
 python3 watch.py --url lockify360.com/en-US --pause 3 --timeout 60
+```
+
+With JSONL + health output:
+
+```bash
+python3 watch.py \
+  --url https://example.com \
+  --jsonl host_error/events.jsonl \
+  --health-file host_error/health.json
+```
+
+Self-test only:
+
+```bash
+python3 watch.py --self-test
 ```
 
 ## Typical Workflow
@@ -97,4 +132,6 @@ python3 watch.py --url lockify360.com/en-US --pause 3 --timeout 60
    - `host_error/host_error_log.txt`
    - `host_error/host_error_stats.csv`
    - timeout diagnostics JSON files in `host_error/`
+   - `host_error/health.json` (or your configured health file)
+   - JSONL events file (if `--jsonl` is enabled)
    - screenshots/HTML artifacts in `host_error/` or `failures/`

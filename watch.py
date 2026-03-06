@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import statistics
+import subprocess
 import tempfile
 import threading
 import time
@@ -44,6 +45,7 @@ HOURLY_HISTORY_HOURS = 24
 BAR_WIDTH = 40
 SPINNER_FRAMES = "|/-\\"
 PAUSE_BAR_WIDTH = 30
+DEFAULT_HEALTH_FILE = os.path.join(HOST_ERROR_DIR, "health.json")
 
 # =========================
 # IDENTIFY THIS PROBE
@@ -203,6 +205,120 @@ def append_csv_row(row):
         writer.writerow(row)
 
 
+def append_jsonl_event(jsonl_path, event_obj):
+    if not jsonl_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(jsonl_path) or ".", exist_ok=True)
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event_obj, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+
+
+def write_health_file(health_file, payload):
+    if not health_file:
+        return
+    try:
+        os.makedirs(os.path.dirname(health_file) or ".", exist_ok=True)
+        tmp_path = f"{health_file}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2)
+        os.replace(tmp_path, health_file)
+    except Exception:
+        pass
+
+
+def collect_process_tree_stats(root_pid):
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,rss=,%cpu=,comm="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception as e:
+        return {"error": f"ps collection failed: {e}"}
+
+    rows = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 4)
+        if len(parts) != 5:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            rss_kb = int(parts[2])
+            cpu_pct = float(parts[3])
+            comm = parts[4]
+        except Exception:
+            continue
+        rows.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "rss_kb": rss_kb,
+                "cpu_pct": cpu_pct,
+                "comm": comm,
+            }
+        )
+
+    by_parent = {}
+    by_pid = {}
+    for row in rows:
+        by_pid[row["pid"]] = row
+        by_parent.setdefault(row["ppid"], []).append(row["pid"])
+
+    if root_pid not in by_pid:
+        return {"error": f"root pid {root_pid} not found in process list"}
+
+    stack = [root_pid]
+    subtree = set()
+    while stack:
+        pid = stack.pop()
+        if pid in subtree:
+            continue
+        subtree.add(pid)
+        for child in by_parent.get(pid, []):
+            stack.append(child)
+
+    subtree_rows = [by_pid[pid] for pid in subtree if pid in by_pid]
+    browser_rows = [
+        r
+        for r in subtree_rows
+        if "chrome" in r["comm"].lower() or "chromium" in r["comm"].lower()
+    ]
+    total_rows = browser_rows if browser_rows else subtree_rows
+    return {
+        "root_pid": root_pid,
+        "process_count": len(total_rows),
+        "rss_mb": round(sum(r["rss_kb"] for r in total_rows) / 1024.0, 2),
+        "cpu_pct": round(sum(r["cpu_pct"] for r in total_rows), 2),
+        "processes": [
+            {
+                "pid": r["pid"],
+                "ppid": r["ppid"],
+                "rss_mb": round(r["rss_kb"] / 1024.0, 2),
+                "cpu_pct": r["cpu_pct"],
+                "comm": r["comm"],
+            }
+            for r in total_rows[:20]
+        ],
+    }
+
+
+def collect_browser_resource_stats(service_process):
+    if service_process is None:
+        return {"error": "no service process"}
+    try:
+        if service_process.poll() is not None:
+            return {"error": "service process is not running"}
+        root_pid = service_process.pid
+    except Exception as e:
+        return {"error": f"service process check failed: {e}"}
+    return collect_process_tree_stats(root_pid)
+
+
 def save_failure_artifacts(driver, attempt, reason):
     target_dir = HOST_ERROR_DIR if reason == "host_error" else FAILURE_DIR
     os.makedirs(target_dir, exist_ok=True)
@@ -259,7 +375,124 @@ def _extract_network_failures(performance_entries, limit=50):
     return failures
 
 
-def save_timeout_diagnostics(driver, attempt, url, timeout_seconds, elapsed_seconds):
+def _network_request_breakdown(performance_entries, top_n=20):
+    requests = {}
+    for entry in performance_entries:
+        try:
+            outer = json.loads(entry.get("message", "{}"))
+            message = outer.get("message", {})
+            method = message.get("method")
+            params = message.get("params", {})
+        except Exception:
+            continue
+
+        if method == "Network.requestWillBeSent":
+            req_id = params.get("requestId")
+            req = params.get("request", {})
+            if not req_id:
+                continue
+            url = req.get("url", "")
+            host = urlparse(url).netloc if url else ""
+            row = requests.setdefault(req_id, {})
+            row["request_id"] = req_id
+            row["url"] = url
+            row["host"] = host
+            row["method"] = req.get("method")
+            row["type"] = params.get("type")
+            row["start_ts"] = params.get("timestamp")
+
+        elif method == "Network.responseReceived":
+            req_id = params.get("requestId")
+            if not req_id:
+                continue
+            resp = params.get("response", {})
+            row = requests.setdefault(req_id, {"request_id": req_id})
+            row["status_code"] = resp.get("status")
+            row["mime_type"] = resp.get("mimeType")
+            row["protocol"] = resp.get("protocol")
+            row["type"] = row.get("type") or params.get("type")
+
+        elif method == "Network.loadingFinished":
+            req_id = params.get("requestId")
+            if not req_id:
+                continue
+            row = requests.setdefault(req_id, {"request_id": req_id})
+            row["end_ts"] = params.get("timestamp")
+            row["encoded_data_length"] = params.get("encodedDataLength")
+            row["finished"] = True
+
+        elif method == "Network.loadingFailed":
+            req_id = params.get("requestId")
+            if not req_id:
+                continue
+            row = requests.setdefault(req_id, {"request_id": req_id})
+            row["failed"] = True
+            row["error_text"] = params.get("errorText")
+            row["canceled"] = params.get("canceled")
+            row["blocked_reason"] = params.get("blockedReason")
+
+    rows = []
+    host_agg = {}
+    for req_id, row in requests.items():
+        start_ts = row.get("start_ts")
+        end_ts = row.get("end_ts")
+        duration_ms = None
+        if isinstance(start_ts, (int, float)) and isinstance(end_ts, (int, float)):
+            duration_ms = max(0.0, (end_ts - start_ts) * 1000.0)
+
+        host = row.get("host") or "(unknown)"
+        agg = host_agg.setdefault(host, {"requests": 0, "failures": 0, "duration_ms_sum": 0.0, "duration_count": 0})
+        agg["requests"] += 1
+        if row.get("failed"):
+            agg["failures"] += 1
+        if duration_ms is not None:
+            agg["duration_ms_sum"] += duration_ms
+            agg["duration_count"] += 1
+
+        rows.append(
+            {
+                "request_id": req_id,
+                "url": row.get("url"),
+                "host": host,
+                "method": row.get("method"),
+                "type": row.get("type"),
+                "status_code": row.get("status_code"),
+                "failed": bool(row.get("failed")),
+                "error_text": row.get("error_text"),
+                "duration_ms": None if duration_ms is None else round(duration_ms, 2),
+                "encoded_data_length": row.get("encoded_data_length"),
+            }
+        )
+
+    top_slowest = sorted(
+        [r for r in rows if r.get("duration_ms") is not None],
+        key=lambda r: r["duration_ms"],
+        reverse=True,
+    )[:top_n]
+    top_failed = sorted([r for r in rows if r.get("failed")], key=lambda r: r.get("host", ""))[:top_n]
+
+    host_summary = []
+    for host, agg in host_agg.items():
+        avg_ms = (agg["duration_ms_sum"] / agg["duration_count"]) if agg["duration_count"] else None
+        host_summary.append(
+            {
+                "host": host,
+                "requests": agg["requests"],
+                "failures": agg["failures"],
+                "avg_duration_ms": None if avg_ms is None else round(avg_ms, 2),
+            }
+        )
+    host_summary.sort(key=lambda r: (r["failures"], r["requests"]), reverse=True)
+
+    return {
+        "request_count": len(rows),
+        "host_summary": host_summary[:top_n],
+        "top_slowest_requests": top_slowest,
+        "top_failed_requests": top_failed,
+    }
+
+
+def save_timeout_diagnostics(driver, attempt, url, timeout_seconds, elapsed_seconds, resource_stats=None):
     os.makedirs(HOST_ERROR_DIR, exist_ok=True)
     stamp = safe_ts()
     base = f"{SERVER_NAME}_attempt_{attempt}_{stamp}_timeout_diagnostics"
@@ -306,6 +539,9 @@ def save_timeout_diagnostics(driver, attempt, url, timeout_seconds, elapsed_seco
     perf_entries = _safe_browser_log(driver, "performance", limit=400)
     diagnostics["browser_log"] = browser_entries
     diagnostics["network_loading_failed"] = _extract_network_failures(perf_entries, limit=100)
+    diagnostics["network_breakdown"] = _network_request_breakdown(perf_entries, top_n=30)
+    if resource_stats is not None:
+        diagnostics["resource_stats"] = resource_stats
 
     try:
         with open(json_path, "w", encoding="utf-8") as f:
@@ -636,7 +872,7 @@ def kill_service_process(service_process):
         pass
 
 
-def run_probe(stdscr, url, pause_seconds, page_load_timeout):
+def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, health_file=None):
     os.makedirs(HOST_ERROR_DIR, exist_ok=True)
 
     hourly_stats = {}
@@ -860,7 +1096,12 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                 log_line(f"[{now()}] [{SERVER_NAME}] {event_body}")
                 save_failure_artifacts(driver, attempt_count, "timeout")
                 timeout_diag_path = save_timeout_diagnostics(
-                    driver, attempt_count, url, page_load_timeout, load_time
+                    driver,
+                    attempt_count,
+                    url,
+                    page_load_timeout,
+                    load_time,
+                    resource_stats=collect_browser_resource_stats(service_process),
                 )
                 if timeout_diag_path:
                     msg = f"[{now()}] [{SERVER_NAME}] timeout diagnostics saved: {timeout_diag_path}"
@@ -893,7 +1134,12 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                 else:
                     save_failure_artifacts(driver, attempt_count, "timeout")
                     timeout_diag_path = save_timeout_diagnostics(
-                        driver, attempt_count, url, page_load_timeout, load_time
+                        driver,
+                        attempt_count,
+                        url,
+                        page_load_timeout,
+                        load_time,
+                        resource_stats=collect_browser_resource_stats(service_process),
                     )
                     if timeout_diag_path:
                         msg = f"[{now()}] [{SERVER_NAME}] timeout diagnostics saved: {timeout_diag_path}"
@@ -957,6 +1203,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                 success_count, failure_count, total_success_load, min_success, max_success, success_samples
             )
             failpct_w, avg_w, min_w, max_w, summary_w = rolling_stats(window_attempts)
+            resource_stats = collect_browser_resource_stats(service_process)
 
             if stdscr is None:
                 print(
@@ -1007,6 +1254,36 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                 browser_binary,
                 url,
             ])
+
+            event_payload = {
+                "timestamp": now(),
+                "server_name": SERVER_NAME,
+                "attempt": attempt_count,
+                "status": status,
+                "url": url,
+                "title": title,
+                "load_time_seconds": round(load_time, 2),
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "consecutive_failures": consecutive_failures,
+                "failure_percent_all_time": failpct_all,
+                "failure_percent_window": failpct_w,
+                "resource_stats": resource_stats,
+            }
+            append_jsonl_event(jsonl_path, event_payload)
+
+            health_payload = {
+                "heartbeat_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "last_event_time": now(),
+                "status": status,
+                "attempt": attempt_count,
+                "url": url,
+                "summary_all": summary_all,
+                "summary_window": summary_w,
+                "consecutive_failures": consecutive_failures,
+                "resource_stats": resource_stats,
+            }
+            write_health_file(health_file, health_payload)
 
             slept = 0.0
             while slept < pause_seconds:
@@ -1060,6 +1337,61 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
             cleanup_dir_tree(d)
 
 
+def run_self_test(page_load_timeout, health_file):
+    failures = []
+    print(f"[{now()}] Starting self-test...", flush=True)
+
+    try:
+        os.makedirs(HOST_ERROR_DIR, exist_ok=True)
+        os.makedirs(FAILURE_DIR, exist_ok=True)
+        print(f"[{now()}] OK writable directories: {HOST_ERROR_DIR}, {FAILURE_DIR}", flush=True)
+    except Exception as e:
+        failures.append(f"directory setup failed: {e}")
+
+    try:
+        ensure_csv_header()
+        log_line(f"[{now()}] [{SERVER_NAME}] self-test log write check")
+        append_jsonl_event(os.path.join(HOST_ERROR_DIR, "events.selftest.jsonl"), {"ts": now(), "self_test": True})
+        write_health_file(health_file, {"heartbeat_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "self_test": True})
+        print(f"[{now()}] OK log/csv/jsonl/health write paths", flush=True)
+    except Exception as e:
+        failures.append(f"log/csv write check failed: {e}")
+
+    browser_binary = find_browser_binary()
+    if not browser_binary:
+        failures.append("browser binary not found (set BROWSER_BINARY or install chrome/chromium)")
+    else:
+        print(f"[{now()}] OK browser binary: {browser_binary}", flush=True)
+
+    driver = None
+    user_data_dir = None
+    try:
+        if browser_binary:
+            driver, user_data_dir, _ = create_driver(browser_binary, page_load_timeout)
+            driver.get("about:blank")
+            _ = driver.title
+            print(f"[{now()}] OK webdriver startup and navigation", flush=True)
+    except Exception as e:
+        failures.append(f"webdriver startup/navigation failed: {e}")
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        if user_data_dir:
+            cleanup_dir_tree(user_data_dir)
+
+    if failures:
+        print(f"[{now()}] SELF-TEST FAILED", flush=True)
+        for item in failures:
+            print(f"- {item}", flush=True)
+        return 1
+
+    print(f"[{now()}] SELF-TEST PASSED", flush=True)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Continuously probe a URL for host errors and log results."
@@ -1067,7 +1399,7 @@ def main():
     parser.add_argument(
         "-u",
         "--url",
-        required=True,
+        required=False,
         help="Target URL to test (accepts with or without scheme)",
     )
     parser.add_argument(
@@ -1082,23 +1414,62 @@ def main():
         default=DEFAULT_PAGE_LOAD_TIMEOUT,
         help=f"Page-load timeout in seconds (default: {DEFAULT_PAGE_LOAD_TIMEOUT})",
     )
+    parser.add_argument(
+        "--jsonl",
+        default=None,
+        help="Optional JSONL event output path (one event per attempt).",
+    )
+    parser.add_argument(
+        "--health-file",
+        default=DEFAULT_HEALTH_FILE,
+        help=f"Health summary JSON output path (default: {DEFAULT_HEALTH_FILE})",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run startup checks (driver, write paths) and exit.",
+    )
     args = parser.parse_args()
-    try:
-        url = normalize_and_validate_url(args.url)
-    except ValueError as e:
-        parser.error(str(e))
     if args.pause <= 0:
         parser.error("--pause must be greater than 0.")
     if args.timeout <= 0:
         parser.error("--timeout must be greater than 0.")
 
+    if args.self_test:
+        raise SystemExit(run_self_test(args.timeout, args.health_file))
+
+    if not args.url:
+        parser.error("--url is required unless --self-test is used.")
+    try:
+        url = normalize_and_validate_url(args.url)
+    except ValueError as e:
+        parser.error(str(e))
+
     pause_seconds = args.pause
     page_load_timeout = args.timeout
+    jsonl_path = args.jsonl
+    health_file = args.health_file
 
     if sys.stdout.isatty():
-        curses.wrapper(lambda stdscr: run_probe(stdscr, url, pause_seconds, page_load_timeout))
+        curses.wrapper(
+            lambda stdscr: run_probe(
+                stdscr,
+                url,
+                pause_seconds,
+                page_load_timeout,
+                jsonl_path=jsonl_path,
+                health_file=health_file,
+            )
+        )
     else:
-        run_probe(None, url, pause_seconds, page_load_timeout)
+        run_probe(
+            None,
+            url,
+            pause_seconds,
+            page_load_timeout,
+            jsonl_path=jsonl_path,
+            health_file=health_file,
+        )
 
 
 if __name__ == "__main__":
