@@ -19,6 +19,10 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
+
+class HardLoadTimeout(WebDriverException):
+    pass
+
 # =========================
 # CONFIG
 # =========================
@@ -311,12 +315,19 @@ def save_timeout_diagnostics(driver, attempt, url, timeout_seconds, elapsed_seco
     return json_path
 
 
-def all_time_stats(success_count, failure_count, total_success_load, min_success, max_success, success_load_times):
+def prune_success_samples(success_samples, now_dt):
+    cutoff = now_dt - timedelta(hours=HOURLY_HISTORY_HOURS)
+    while success_samples and success_samples[0][0] < cutoff:
+        success_samples.popleft()
+
+
+def all_time_stats(success_count, failure_count, total_success_load, min_success, max_success, success_samples):
     attempts = success_count + failure_count
 
     if success_count > 0:
         avg = total_success_load / float(success_count)
-        median = statistics.median(success_load_times) if success_load_times else None
+        recent_times = [load for _, load in success_samples]
+        median = statistics.median(recent_times) if recent_times else None
         avg_str = f"{avg:.2f}s"
         med_str = "n/a" if median is None else f"{median:.2f}s"
         min_str = f"{min_success:.2f}s"
@@ -333,7 +344,7 @@ def all_time_stats(success_count, failure_count, total_success_load, min_success
 
     summary = (
         f"all_time: success={success_count} failed={failure_count} "
-        f"fail_pct={fail_pct_str} avg={avg_str} med={med_str} min={min_str} max={max_str}"
+        f"fail_pct={fail_pct_str} avg={avg_str} med_24h={med_str} min={min_str} max={max_str}"
     )
 
     return avg, fail_pct, summary
@@ -594,15 +605,13 @@ def create_driver(browser_binary, page_load_timeout):
 
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(page_load_timeout)
-    return driver, user_data_dir
+    service_process = getattr(getattr(driver, "service", None), "process", None)
+    return driver, user_data_dir, service_process
 
 
-def force_kill_driver_service(driver):
+def kill_service_process(service_process):
     try:
-        service_process = getattr(getattr(driver, "service", None), "process", None)
-        if service_process is None:
-            return
-        if service_process.poll() is None:
+        if service_process is not None and service_process.poll() is None:
             service_process.kill()
     except Exception:
         pass
@@ -656,14 +665,15 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
             "BROWSER_BINARY=/path/to/binary environment variable."
         )
 
-    hard_page_load_timeout = page_load_timeout + HARD_PAGE_LOAD_TIMEOUT_GRACE
     temp_dirs = []
-    active_worker = None
     stop_requested = False
+    hard_page_load_timeout = page_load_timeout + HARD_PAGE_LOAD_TIMEOUT_GRACE
 
     driver = None
+    service_process = None
+    active_worker = None
     try:
-        driver, user_data_dir = create_driver(browser_binary, page_load_timeout)
+        driver, user_data_dir, service_process = create_driver(browser_binary, page_load_timeout)
         temp_dirs.append(user_data_dir)
 
         attempt_count = 0
@@ -674,7 +684,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
         total_success_load = 0.0
         min_success = None
         max_success = None
-        success_load_times = []
+        success_samples = deque()
 
         window_attempts = deque(maxlen=ROLLING_WINDOW)
         last_event = "Ready. Waiting for first attempt..."
@@ -704,20 +714,22 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
             try:
                 result = {}
                 worker_exc = {}
+                load_interrupted = None
 
-                def _load_page():
+                load_driver = driver
+
+                def _load_page(active_driver=load_driver):
                     try:
-                        driver.get(url)
-                        result["title"] = driver.title or ""
-                        result["source"] = driver.page_source or ""
+                        active_driver.get(url)
+                        result["title"] = active_driver.title or ""
+                        result["source"] = active_driver.page_source or ""
                     except Exception as ex:
                         worker_exc["error"] = ex
 
-                worker = threading.Thread(target=_load_page, daemon=True)
-                active_worker = worker
-                worker.start()
+                active_worker = threading.Thread(target=_load_page, daemon=True)
+                active_worker.start()
                 spinner_idx = 0
-                while worker.is_alive():
+                while active_worker.is_alive():
                     if stdscr is not None:
                         render_dashboard(
                             stdscr,
@@ -742,23 +754,35 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                         key = stdscr.getch()
                         if key in (ord("q"), ord("Q")):
                             stop_requested = True
-                            last_event = f"[{now()}] Stop requested. Finishing current attempt..."
+                            load_interrupted = "user_stop"
+                            last_event = f"[{now()}] Stop requested. Interrupting active page load..."
+                            kill_service_process(service_process)
+                            break
+                    if (time.perf_counter() - start_ts) >= hard_page_load_timeout:
+                        load_interrupted = "hard_timeout"
+                        kill_service_process(service_process)
+                        break
                     spinner_idx += 1
-                    elapsed = time.perf_counter() - start_ts
-                    if elapsed >= hard_page_load_timeout:
-                        force_kill_driver_service(driver)
-                        worker.join(timeout=1.0)
-                        active_worker = None if not worker.is_alive() else worker
-                        if worker.is_alive():
-                            stop_requested = True
-                            last_event = f"[{now()}] Stop: load worker stuck after hard timeout."
-                            raise KeyboardInterrupt
-                        raise WebDriverException(
-                            f"hard timeout waiting for load thread after {elapsed:.2f}s"
-                        )
                     time.sleep(0.1)
-                worker.join()
+
+                active_worker.join(timeout=3.0)
+                if active_worker.is_alive():
+                    last_event = f"[{now()}] Load worker did not exit after forced interruption."
+                    if load_interrupted == "user_stop":
+                        stop_requested = True
+                        raise KeyboardInterrupt
+                    if load_interrupted == "hard_timeout":
+                        raise HardLoadTimeout(
+                            "load worker did not exit after hard-timeout interruption"
+                        )
+                    raise WebDriverException("load worker did not exit after forced interruption")
                 active_worker = None
+                if stop_requested:
+                    raise KeyboardInterrupt
+                if load_interrupted == "hard_timeout":
+                    raise HardLoadTimeout(
+                        f"hard timeout waiting for page load after {hard_page_load_timeout:.2f}s"
+                    )
                 if "error" in worker_exc:
                     raise worker_exc["error"]
 
@@ -787,7 +811,8 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                     success_count += 1
                     consecutive_failures = 0
                     total_success_load += load_time
-                    success_load_times.append(load_time)
+                    success_samples.append((event_time, load_time))
+                    prune_success_samples(success_samples, event_time)
                     if min_success is None or load_time < min_success:
                         min_success = load_time
                     if max_success is None or load_time > max_success:
@@ -824,6 +849,54 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                     if stdscr is None:
                         print(msg, flush=True)
 
+            except HardLoadTimeout as e:
+                status = "hard_timeout"
+                is_failure = True
+                failure_count += 1
+                consecutive_failures += 1
+                load_time = time.perf_counter() - start_ts
+                error_line = str(e).splitlines()[0] if str(e) else "hard timeout"
+                event_body = f"FAILED hard timeout - elapsed={load_time:.2f}s - error={error_line}"
+                last_event = f"[{now()}] {event_body}"
+                recent_events.append({"text": last_event, "status": "failed"})
+                if stdscr is None:
+                    print(
+                        f"[{now()}] [{SERVER_NAME}] FAILED - hard timeout "
+                        f"- elapsed={load_time:.2f}s - error={error_line}",
+                        flush=True,
+                    )
+                log_line(f"[{now()}] [{SERVER_NAME}] {event_body}")
+                worker_still_active = active_worker is not None and active_worker.is_alive()
+                if worker_still_active:
+                    log_line(
+                        f"[{now()}] [{SERVER_NAME}] skipped timeout artifacts/diagnostics; load worker still active"
+                    )
+                else:
+                    save_failure_artifacts(driver, attempt_count, "timeout")
+                    timeout_diag_path = save_timeout_diagnostics(
+                        driver, attempt_count, url, page_load_timeout, load_time
+                    )
+                    if timeout_diag_path:
+                        msg = f"[{now()}] [{SERVER_NAME}] timeout diagnostics saved: {timeout_diag_path}"
+                        log_line(msg)
+                        if stdscr is None:
+                            print(msg, flush=True)
+
+                # Recreate the driver/session after hard timeout interruption.
+                old_user_data_dir = user_data_dir
+                try:
+                    if driver is not None:
+                        if not (active_worker is not None and active_worker.is_alive()):
+                            driver.quit()
+                except Exception:
+                    pass
+                cleanup_dir_tree(old_user_data_dir)
+                if old_user_data_dir in temp_dirs and not os.path.exists(old_user_data_dir):
+                    temp_dirs.remove(old_user_data_dir)
+                driver, user_data_dir, service_process = create_driver(browser_binary, page_load_timeout)
+                temp_dirs.append(user_data_dir)
+                active_worker = None
+
             except WebDriverException as e:
                 status = "webdriver_error"
                 is_failure = True
@@ -841,21 +914,28 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                         flush=True,
                     )
                 log_line(f"[{now()}] [{SERVER_NAME}] {event_body}")
-                save_failure_artifacts(driver, attempt_count, "webdriver_error")
+                if not (active_worker is not None and active_worker.is_alive()):
+                    save_failure_artifacts(driver, attempt_count, "webdriver_error")
                 # Recreate the driver/session after webdriver-level failures.
+                old_user_data_dir = user_data_dir
                 try:
                     if driver is not None:
                         if not (active_worker is not None and active_worker.is_alive()):
                             driver.quit()
                 except Exception:
                     pass
-                driver, user_data_dir = create_driver(browser_binary, page_load_timeout)
+                cleanup_dir_tree(old_user_data_dir)
+                if old_user_data_dir in temp_dirs and not os.path.exists(old_user_data_dir):
+                    temp_dirs.remove(old_user_data_dir)
+                driver, user_data_dir, service_process = create_driver(browser_binary, page_load_timeout)
                 temp_dirs.append(user_data_dir)
+                active_worker = None
 
             update_hourly_stats(hourly_stats, event_time, is_failure)
+            prune_success_samples(success_samples, event_time)
             window_attempts.append({"ok": ok_for_window, "load_time": load_time_for_window})
             avg_all, failpct_all, summary_all = all_time_stats(
-                success_count, failure_count, total_success_load, min_success, max_success, success_load_times
+                success_count, failure_count, total_success_load, min_success, max_success, success_samples
             )
             failpct_w, avg_w, min_w, max_w, summary_w = rolling_stats(window_attempts)
 
