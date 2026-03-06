@@ -1,9 +1,11 @@
 import csv
 import argparse
 import curses
+import json
 import os
 import re
 import socket
+import statistics
 import tempfile
 import threading
 import time
@@ -25,7 +27,7 @@ DEFAULT_PAGE_LOAD_TIMEOUT = 60
 HARD_PAGE_LOAD_TIMEOUT_GRACE = 15
 
 HOST_ERROR_DIR = "host_error"
-TEXT_LOG_FILE = "host_error_log.txt"
+TEXT_LOG_FILE = os.path.join(HOST_ERROR_DIR, "host_error_log.txt")
 CSV_LOG_FILE = os.path.join(HOST_ERROR_DIR, "host_error_stats.csv")
 FAILURE_DIR = "failures"
 
@@ -217,17 +219,112 @@ def save_failure_artifacts(driver, attempt, reason):
         pass
 
 
-def all_time_stats(success_count, failure_count, total_success_load, min_success, max_success):
+def _safe_browser_log(driver, log_type, limit=50):
+    try:
+        entries = driver.get_log(log_type)
+        if len(entries) > limit:
+            return entries[-limit:]
+        return entries
+    except Exception as e:
+        return [{"error": f"could not read {log_type} log: {e}"}]
+
+
+def _extract_network_failures(performance_entries, limit=50):
+    failures = []
+    for entry in performance_entries:
+        try:
+            message = json.loads(entry.get("message", "{}")).get("message", {})
+            if message.get("method") != "Network.loadingFailed":
+                continue
+            params = message.get("params", {})
+            failures.append(
+                {
+                    "timestamp": entry.get("timestamp"),
+                    "requestId": params.get("requestId"),
+                    "type": params.get("type"),
+                    "errorText": params.get("errorText"),
+                    "blockedReason": params.get("blockedReason"),
+                    "canceled": params.get("canceled"),
+                }
+            )
+        except Exception:
+            continue
+    if len(failures) > limit:
+        return failures[-limit:]
+    return failures
+
+
+def save_timeout_diagnostics(driver, attempt, url, timeout_seconds, elapsed_seconds):
+    os.makedirs(HOST_ERROR_DIR, exist_ok=True)
+    stamp = safe_ts()
+    base = f"{SERVER_NAME}_attempt_{attempt}_{stamp}_timeout_diagnostics"
+    json_path = os.path.join(HOST_ERROR_DIR, base + ".json")
+
+    diagnostics = {
+        "timestamp": now(),
+        "server_name": SERVER_NAME,
+        "attempt": attempt,
+        "url_requested": url,
+        "timeout_seconds": timeout_seconds,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+    }
+
+    try:
+        diagnostics["current_url"] = driver.current_url
+    except Exception as e:
+        diagnostics["current_url_error"] = str(e)
+
+    try:
+        diagnostics["title"] = driver.title
+    except Exception as e:
+        diagnostics["title_error"] = str(e)
+
+    try:
+        diagnostics["ready_state"] = driver.execute_script("return document.readyState")
+    except Exception as e:
+        diagnostics["ready_state_error"] = str(e)
+
+    try:
+        diagnostics["navigation_entry"] = driver.execute_script(
+            "const nav = performance.getEntriesByType('navigation');"
+            "return nav && nav.length ? nav[0].toJSON() : null;"
+        )
+    except Exception as e:
+        diagnostics["navigation_entry_error"] = str(e)
+
+    try:
+        diagnostics["performance_timing"] = driver.execute_script("return performance.timing")
+    except Exception as e:
+        diagnostics["performance_timing_error"] = str(e)
+
+    browser_entries = _safe_browser_log(driver, "browser", limit=50)
+    perf_entries = _safe_browser_log(driver, "performance", limit=400)
+    diagnostics["browser_log"] = browser_entries
+    diagnostics["network_loading_failed"] = _extract_network_failures(perf_entries, limit=100)
+
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(diagnostics, f, ensure_ascii=True, indent=2)
+    except Exception:
+        return None
+
+    return json_path
+
+
+def all_time_stats(success_count, failure_count, total_success_load, min_success, max_success, success_load_times):
     attempts = success_count + failure_count
 
     if success_count > 0:
         avg = total_success_load / float(success_count)
+        median = statistics.median(success_load_times) if success_load_times else None
         avg_str = f"{avg:.2f}s"
+        med_str = "n/a" if median is None else f"{median:.2f}s"
         min_str = f"{min_success:.2f}s"
         max_str = f"{max_success:.2f}s"
     else:
         avg = None
         avg_str = "n/a"
+        med_str = "n/a"
         min_str = "n/a"
         max_str = "n/a"
 
@@ -236,7 +333,7 @@ def all_time_stats(success_count, failure_count, total_success_load, min_success
 
     summary = (
         f"all_time: success={success_count} failed={failure_count} "
-        f"fail_pct={fail_pct_str} avg={avg_str} min={min_str} max={max_str}"
+        f"fail_pct={fail_pct_str} avg={avg_str} med={med_str} min={min_str} max={max_str}"
     )
 
     return avg, fail_pct, summary
@@ -267,18 +364,20 @@ def rolling_stats(window_attempts):
 
     if success_times:
         avg = sum(success_times) / float(len(success_times))
+        med = statistics.median(success_times)
         mn = min(success_times)
         mx = max(success_times)
         avg_str = f"{avg:.2f}s"
+        med_str = f"{med:.2f}s"
         mn_str = f"{mn:.2f}s"
         mx_str = f"{mx:.2f}s"
     else:
         avg = mn = mx = None
-        avg_str = mn_str = mx_str = "n/a"
+        avg_str = med_str = mn_str = mx_str = "n/a"
 
     summary = (
         f"last_{ROLLING_WINDOW}: n={n} fail_pct={fail_pct:.1f}% "
-        f"avg={avg_str} min={mn_str} max={mx_str}"
+        f"avg={avg_str} med={med_str} min={mn_str} max={mx_str}"
     )
     return fail_pct, avg, mn, mx, summary
 
@@ -491,6 +590,7 @@ def create_driver(browser_binary, page_load_timeout):
     user_data_dir = tempfile.mkdtemp(prefix="selenium_chrome_")
     options.add_argument(f"--user-data-dir={user_data_dir}")
     options.binary_location = browser_binary
+    options.set_capability("goog:loggingPrefs", {"browser": "ALL", "performance": "ALL"})
 
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(page_load_timeout)
@@ -574,6 +674,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
         total_success_load = 0.0
         min_success = None
         max_success = None
+        success_load_times = []
 
         window_attempts = deque(maxlen=ROLLING_WINDOW)
         last_event = "Ready. Waiting for first attempt..."
@@ -686,6 +787,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                     success_count += 1
                     consecutive_failures = 0
                     total_success_load += load_time
+                    success_load_times.append(load_time)
                     if min_success is None or load_time < min_success:
                         min_success = load_time
                     if max_success is None or load_time > max_success:
@@ -713,6 +815,14 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                     )
                 log_line(f"[{now()}] [{SERVER_NAME}] {event_body}")
                 save_failure_artifacts(driver, attempt_count, "timeout")
+                timeout_diag_path = save_timeout_diagnostics(
+                    driver, attempt_count, url, page_load_timeout, load_time
+                )
+                if timeout_diag_path:
+                    msg = f"[{now()}] [{SERVER_NAME}] timeout diagnostics saved: {timeout_diag_path}"
+                    log_line(msg)
+                    if stdscr is None:
+                        print(msg, flush=True)
 
             except WebDriverException as e:
                 status = "webdriver_error"
@@ -745,7 +855,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
             update_hourly_stats(hourly_stats, event_time, is_failure)
             window_attempts.append({"ok": ok_for_window, "load_time": load_time_for_window})
             avg_all, failpct_all, summary_all = all_time_stats(
-                success_count, failure_count, total_success_load, min_success, max_success
+                success_count, failure_count, total_success_load, min_success, max_success, success_load_times
             )
             failpct_w, avg_w, min_w, max_w, summary_w = rolling_stats(window_attempts)
 
