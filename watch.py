@@ -27,6 +27,7 @@ HARD_PAGE_LOAD_TIMEOUT_GRACE = 15
 TEXT_LOG_FILE = "host_error_log.txt"
 CSV_LOG_FILE = "host_error_stats.csv"
 FAILURE_DIR = "failures"
+HOST_ERROR_DIR = "host_error"
 
 # If you want to watch the browser, set HEADLESS = False
 HEADLESS = True
@@ -196,12 +197,13 @@ def append_csv_row(row):
 
 
 def save_failure_artifacts(driver, attempt, reason):
-    os.makedirs(FAILURE_DIR, exist_ok=True)
+    target_dir = HOST_ERROR_DIR if reason == "host_error" else FAILURE_DIR
+    os.makedirs(target_dir, exist_ok=True)
     stamp = safe_ts()
     base = f"{SERVER_NAME}_attempt_{attempt}_{stamp}_{reason}"
 
-    screenshot_path = os.path.join(FAILURE_DIR, base + ".png")
-    html_path = os.path.join(FAILURE_DIR, base + ".html")
+    screenshot_path = os.path.join(target_dir, base + ".png")
+    html_path = os.path.join(target_dir, base + ".html")
 
     try:
         driver.save_screenshot(screenshot_path)
@@ -507,6 +509,8 @@ def force_kill_driver_service(driver):
 
 
 def run_probe(stdscr, url, pause_seconds, page_load_timeout):
+    os.makedirs(HOST_ERROR_DIR, exist_ok=True)
+
     hourly_stats = {}
     summary_all = "all_time: success=0 failed=0 fail_pct=n/a avg=n/a min=n/a max=n/a"
     summary_w = f"last_{ROLLING_WINDOW}: n=0"
