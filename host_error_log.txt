@@ -1,0 +1,5 @@
+[2026-03-06 11:42:58] [Daniels-MacBook-Pro.local] FAILED timeout after 20.00s - elapsed=20.01s
+[2026-03-06 11:43:30] [Daniels-MacBook-Pro.local] FAILED timeout after 20.00s - elapsed=20.01s
+[2026-03-06 11:44:47] [Daniels-MacBook-Pro.local] FAILED timeout after 20.00s - elapsed=20.01s
+[2026-03-06 11:45:28] [Daniels-MacBook-Pro.local] FAILED timeout after 20.00s - elapsed=20.01s
+[2026-03-06 11:46:14] [Daniels-MacBook-Pro.local] FAILED timeout after 20.00s - elapsed=20.01s
