@@ -43,6 +43,7 @@ ROLLING_WINDOW = 50
 HOURLY_HISTORY_HOURS = 24
 BAR_WIDTH = 40
 SPINNER_FRAMES = "|/-\\"
+PAUSE_BAR_WIDTH = 30
 
 # =========================
 # IDENTIFY THIS PROBE
@@ -532,6 +533,24 @@ def render_dashboard(stdscr, state):
         )
         y += 1
 
+    if y < max_y and state.get("is_pausing"):
+        pause_total = state.get("pause_total", 0.0)
+        pause_remaining = state.get("pause_remaining", 0.0)
+        if pause_total > 0:
+            ratio = max(0.0, min(1.0, pause_remaining / pause_total))
+            filled = int(round(PAUSE_BAR_WIDTH * ratio))
+        else:
+            filled = 0
+        bar = "#" * filled + "-" * (PAUSE_BAR_WIDTH - filled)
+        safe_addstr(
+            stdscr,
+            y,
+            0,
+            f"Pause: {pause_remaining:.1f}s [{bar}]",
+            testing_attr,
+        )
+        y += 1
+
     if y < max_y:
         event_text = f"Last event: {state['last_event']}"
         status = state.get("last_event_status", "info")
@@ -991,6 +1010,31 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
 
             slept = 0.0
             while slept < pause_seconds:
+                remaining = max(0.0, pause_seconds - slept)
+                if stdscr is not None:
+                    render_dashboard(
+                        stdscr,
+                        {
+                            "url": url,
+                            "pause_seconds": pause_seconds,
+                            "page_load_timeout": page_load_timeout,
+                            "hourly_stats": hourly_stats,
+                            "summary_all": (
+                                f"attempts={attempt_count} consecutive_failures={consecutive_failures} | {summary_all}"
+                            ),
+                            "summary_w": summary_w,
+                            "last_event": last_event,
+                            "last_event_status": ("failed" if is_failure else "ok"),
+                            "recent_events": list(recent_events),
+                            "is_testing": False,
+                            "is_pausing": True,
+                            "pause_total": pause_seconds,
+                            "pause_remaining": remaining,
+                            "spinner_frame": SPINNER_FRAMES[0],
+                            "colors": colors,
+                            "last_update": now(),
+                        },
+                    )
                 step = min(0.2, pause_seconds - slept)
                 time.sleep(step)
                 slept += step
