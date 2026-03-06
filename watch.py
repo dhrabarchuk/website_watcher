@@ -2,6 +2,7 @@ import csv
 import argparse
 import curses
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -20,7 +21,8 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 # CONFIG
 # =========================
 DEFAULT_PAUSE_SECONDS = 5
-DEFAULT_PAGE_LOAD_TIMEOUT = 20
+DEFAULT_PAGE_LOAD_TIMEOUT = 60
+HARD_PAGE_LOAD_TIMEOUT_GRACE = 15
 
 TEXT_LOG_FILE = "host_error_log.txt"
 CSV_LOG_FILE = "host_error_stats.csv"
@@ -139,17 +141,17 @@ def looks_like_host_error(title, page_source):
 
     # "cloudflare" alone appears on many healthy pages; only treat it as an
     # error signal when paired with Cloudflare-specific error wording.
-    cloudflare_error_checks = [
-        "cloudflare ray id",
-        "error code 10",
-        "error code 52",
-        "error code 53",
-    ]
+    cloudflare_error_checks = ["cloudflare ray id"]
 
     if any(item in text for item in generic_error_checks):
         return True
 
-    if "cloudflare" in text and any(item in text for item in cloudflare_error_checks):
+    # Match Cloudflare-style codes precisely to avoid accidental matches
+    # like "error code 1000" when checking for "10".
+    has_cf_error_code = re.search(r"\berror code\s*(?:10\d{2}|52\d|53\d)\b", text) is not None
+    if "cloudflare" in text and (
+        any(item in text for item in cloudflare_error_checks) or has_cf_error_code
+    ):
         return True
 
     return False
@@ -393,8 +395,20 @@ def render_dashboard(stdscr, state):
 
     if y < max_y:
         y += 1
-        safe_addstr(stdscr, y, 0, f"Totals: {state['summary_all']} | {state['summary_w']}")
+        summary_all_line = state.get("summary_all", "")
+        prefix = "attempts="
+        totals_line = summary_all_line
+        all_time_line = summary_all_line
+        if summary_all_line.startswith(prefix) and " | " in summary_all_line:
+            totals_line, all_time_line = summary_all_line.split(" | ", 1)
+        safe_addstr(stdscr, y, 0, f"Totals: {totals_line}")
         y += 1
+        if y < max_y:
+            safe_addstr(stdscr, y, 0, f"All-time: {all_time_line}")
+            y += 1
+        if y < max_y:
+            safe_addstr(stdscr, y, 0, f"Window: {state['summary_w']}")
+            y += 1
 
     if y < max_y and state.get("is_testing"):
         safe_addstr(
@@ -461,6 +475,37 @@ def cleanup_dir_tree(path):
         pass
 
 
+def create_driver(browser_binary, page_load_timeout):
+    options = Options()
+    if HEADLESS:
+        options.add_argument("--headless=new")
+
+    # Stability flags for servers/containers/root sessions
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,1024")
+
+    user_data_dir = tempfile.mkdtemp(prefix="selenium_chrome_")
+    options.add_argument(f"--user-data-dir={user_data_dir}")
+    options.binary_location = browser_binary
+
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(page_load_timeout)
+    return driver, user_data_dir
+
+
+def force_kill_driver_service(driver):
+    try:
+        service_process = getattr(getattr(driver, "service", None), "process", None)
+        if service_process is None:
+            return
+        if service_process.poll() is None:
+            service_process.kill()
+    except Exception:
+        pass
+
+
 def run_probe(stdscr, url, pause_seconds, page_load_timeout):
     hourly_stats = {}
     summary_all = "all_time: success=0 failed=0 fail_pct=n/a avg=n/a min=n/a max=n/a"
@@ -507,24 +552,15 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
             "BROWSER_BINARY=/path/to/binary environment variable."
         )
 
-    options = Options()
-    if HEADLESS:
-        options.add_argument("--headless=new")
-
-    # Stability flags for servers/containers/root sessions
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,1024")
-
-    user_data_dir = tempfile.mkdtemp(prefix="selenium_chrome_")
-    options.add_argument(f"--user-data-dir={user_data_dir}")
-    options.binary_location = browser_binary
+    hard_page_load_timeout = page_load_timeout + HARD_PAGE_LOAD_TIMEOUT_GRACE
+    temp_dirs = []
+    active_worker = None
+    stop_requested = False
 
     driver = None
     try:
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(page_load_timeout)
+        driver, user_data_dir = create_driver(browser_binary, page_load_timeout)
+        temp_dirs.append(user_data_dir)
 
         attempt_count = 0
         success_count = 0
@@ -573,6 +609,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                         worker_exc["error"] = ex
 
                 worker = threading.Thread(target=_load_page, daemon=True)
+                active_worker = worker
                 worker.start()
                 spinner_idx = 0
                 while worker.is_alive():
@@ -599,10 +636,24 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                         )
                         key = stdscr.getch()
                         if key in (ord("q"), ord("Q")):
-                            raise KeyboardInterrupt
+                            stop_requested = True
+                            last_event = f"[{now()}] Stop requested. Finishing current attempt..."
                     spinner_idx += 1
+                    elapsed = time.perf_counter() - start_ts
+                    if elapsed >= hard_page_load_timeout:
+                        force_kill_driver_service(driver)
+                        worker.join(timeout=1.0)
+                        active_worker = None if not worker.is_alive() else worker
+                        if worker.is_alive():
+                            stop_requested = True
+                            last_event = f"[{now()}] Stop: load worker stuck after hard timeout."
+                            raise KeyboardInterrupt
+                        raise WebDriverException(
+                            f"hard timeout waiting for load thread after {elapsed:.2f}s"
+                        )
                     time.sleep(0.1)
                 worker.join()
+                active_worker = None
                 if "error" in worker_exc:
                     raise worker_exc["error"]
 
@@ -677,6 +728,15 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                     )
                 log_line(f"[{now()}] [{SERVER_NAME}] {event_body}")
                 save_failure_artifacts(driver, attempt_count, "webdriver_error")
+                # Recreate the driver/session after webdriver-level failures.
+                try:
+                    if driver is not None:
+                        if not (active_worker is not None and active_worker.is_alive()):
+                            driver.quit()
+                except Exception:
+                    pass
+                driver, user_data_dir = create_driver(browser_binary, page_load_timeout)
+                temp_dirs.append(user_data_dir)
 
             update_hourly_stats(hourly_stats, event_time, is_failure)
             window_attempts.append({"ok": ok_for_window, "load_time": load_time_for_window})
@@ -743,7 +803,10 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
                 if stdscr is not None:
                     key = stdscr.getch()
                     if key in (ord("q"), ord("Q")):
-                        raise KeyboardInterrupt
+                        stop_requested = True
+                        break
+            if stop_requested:
+                raise KeyboardInterrupt
 
     except KeyboardInterrupt:
         if stdscr is None:
@@ -751,10 +814,12 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout):
     finally:
         if driver is not None:
             try:
-                driver.quit()
+                if not (active_worker is not None and active_worker.is_alive()):
+                    driver.quit()
             except Exception:
                 pass
-        cleanup_dir_tree(user_data_dir)
+        for d in temp_dirs:
+            cleanup_dir_tree(d)
 
 
 def main():
