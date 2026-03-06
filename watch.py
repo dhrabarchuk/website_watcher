@@ -24,10 +24,10 @@ DEFAULT_PAUSE_SECONDS = 5
 DEFAULT_PAGE_LOAD_TIMEOUT = 60
 HARD_PAGE_LOAD_TIMEOUT_GRACE = 15
 
-TEXT_LOG_FILE = "host_error_log.txt"
-CSV_LOG_FILE = "host_error_stats.csv"
-FAILURE_DIR = "failures"
 HOST_ERROR_DIR = "host_error"
+TEXT_LOG_FILE = "host_error_log.txt"
+CSV_LOG_FILE = os.path.join(HOST_ERROR_DIR, "host_error_stats.csv")
+FAILURE_DIR = "failures"
 
 # If you want to watch the browser, set HEADLESS = False
 HEADLESS = True
