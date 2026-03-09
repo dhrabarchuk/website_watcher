@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import deque
 from shutil import which
 from urllib.parse import urlparse
@@ -165,6 +165,58 @@ def looks_like_host_error(title, page_source):
         return True
 
     return False
+
+
+def _shorten(value, max_len=140):
+    text = (value or "").strip()
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return f"{text[:max_len - 3]}..."
+
+
+def summarize_timeout_diagnostics(json_path):
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            diagnostics = json.load(f)
+    except Exception:
+        return None
+
+    network = diagnostics.get("network_breakdown", {})
+    for request in network.get("top_failed_requests", []) or []:
+        host = request.get("host") or "(unknown)"
+        status_code = request.get("status_code")
+        error_text = request.get("error_text") or request.get("blocked_reason")
+        if error_text and status_code is not None:
+            return _shorten(f"{host}: status={status_code} {error_text}")
+        if error_text:
+            return _shorten(f"{host}: {error_text}")
+        if status_code is not None:
+            return _shorten(f"{host}: status={status_code}")
+
+    for failure in diagnostics.get("network_loading_failed", []) or []:
+        error_text = failure.get("errorText") or failure.get("blockedReason")
+        if error_text:
+            return _shorten(f"network: {error_text}")
+
+    for entry in diagnostics.get("browser_log", []) or []:
+        try:
+            level = entry.get("level", {})
+            level_name = level.get("level") if isinstance(level, dict) else level
+        except Exception:
+            level_name = None
+        if str(level_name).upper() != "SEVERE":
+            continue
+        message = entry.get("message")
+        if message:
+            return _shorten(f"browser: {message}")
+
+    title = diagnostics.get("title")
+    if title:
+        return _shorten(f"title: {title}")
+
+    return None
 
 
 def log_line(message):
@@ -960,6 +1012,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
             ok_for_window = False
             load_time_for_window = None
             is_failure = False
+            failure_summary = ""
 
             if stdscr is None:
                 print(f"\n[{now()}] [{SERVER_NAME}] Attempt {attempt_count}: loading {url}", flush=True)
@@ -1050,6 +1103,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
                     is_failure = True
                     failure_count += 1
                     consecutive_failures += 1
+                    failure_summary = f"title={title}"
 
                     event_body = f"FAILED host error - load_time={load_time:.2f}s - title={title}"
                     last_event = f"[{now()}] {event_body}"
@@ -1078,23 +1132,13 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
                     if stdscr is None:
                         print(f"[{now()}] [{SERVER_NAME}] OK - load_time={load_time:.2f}s - title={title}", flush=True)
 
-            except TimeoutException:
+            except TimeoutException as e:
                 status = "timeout"
                 is_failure = True
                 failure_count += 1
                 consecutive_failures += 1
                 load_time = time.perf_counter() - start_ts
-                event_body = f"FAILED timeout after {page_load_timeout:.2f}s - elapsed={load_time:.2f}s"
-                last_event = f"[{now()}] {event_body}"
-                recent_events.append({"text": last_event, "status": "failed"})
-                if stdscr is None:
-                    print(
-                        f"[{now()}] [{SERVER_NAME}] FAILED - timeout after {page_load_timeout:.2f}s "
-                        f"- elapsed={load_time:.2f}s",
-                        flush=True,
-                    )
-                log_line(f"[{now()}] [{SERVER_NAME}] {event_body}")
-                save_failure_artifacts(driver, attempt_count, "timeout")
+                exception_line = str(e).splitlines()[0] if str(e) else "timeout exception"
                 timeout_diag_path = save_timeout_diagnostics(
                     driver,
                     attempt_count,
@@ -1103,11 +1147,32 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
                     load_time,
                     resource_stats=collect_browser_resource_stats(service_process),
                 )
+                diag_summary = summarize_timeout_diagnostics(timeout_diag_path) if timeout_diag_path else None
+                if diag_summary:
+                    failure_summary = f"details: {diag_summary}"
+                    event_body = (
+                        f"FAILED timeout after {page_load_timeout:.2f}s - elapsed={load_time:.2f}s - "
+                        f"{failure_summary}"
+                    )
+                else:
+                    failure_summary = f"error={exception_line}"
+                    event_body = (
+                        f"FAILED timeout after {page_load_timeout:.2f}s - elapsed={load_time:.2f}s - "
+                        f"{failure_summary}"
+                    )
+
                 if timeout_diag_path:
                     msg = f"[{now()}] [{SERVER_NAME}] timeout diagnostics saved: {timeout_diag_path}"
                     log_line(msg)
                     if stdscr is None:
                         print(msg, flush=True)
+
+                last_event = f"[{now()}] {event_body}"
+                recent_events.append({"text": last_event, "status": "failed"})
+                if stdscr is None:
+                    print(f"[{now()}] [{SERVER_NAME}] {event_body}", flush=True)
+                log_line(f"[{now()}] [{SERVER_NAME}] {event_body}")
+                save_failure_artifacts(driver, attempt_count, "timeout")
 
             except HardLoadTimeout as e:
                 status = "hard_timeout"
@@ -1117,6 +1182,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
                 load_time = time.perf_counter() - start_ts
                 error_line = str(e).splitlines()[0] if str(e) else "hard timeout"
                 event_body = f"FAILED hard timeout - elapsed={load_time:.2f}s - error={error_line}"
+                failure_summary = error_line
                 last_event = f"[{now()}] {event_body}"
                 recent_events.append({"text": last_event, "status": "failed"})
                 if stdscr is None:
@@ -1142,6 +1208,16 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
                         resource_stats=collect_browser_resource_stats(service_process),
                     )
                     if timeout_diag_path:
+                        diag_summary = summarize_timeout_diagnostics(timeout_diag_path)
+                        if diag_summary:
+                            failure_summary = f"{error_line} - details: {diag_summary}"
+                            event_body = (
+                                f"FAILED hard timeout - elapsed={load_time:.2f}s - "
+                                f"error={error_line} - details: {diag_summary}"
+                            )
+                            last_event = f"[{now()}] {event_body}"
+                            if recent_events:
+                                recent_events[-1] = {"text": last_event, "status": "failed"}
                         msg = f"[{now()}] [{SERVER_NAME}] timeout diagnostics saved: {timeout_diag_path}"
                         log_line(msg)
                         if stdscr is None:
@@ -1169,6 +1245,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
                 consecutive_failures += 1
                 load_time = time.perf_counter() - start_ts
                 error_line = str(e).splitlines()[0] if str(e) else "unknown webdriver error"
+                failure_summary = error_line
                 event_body = f"FAILED webdriver error - elapsed={load_time:.2f}s - error={error_line}"
                 last_event = f"[{now()}] {event_body}"
                 recent_events.append({"text": last_event, "status": "failed"})
@@ -1261,6 +1338,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
                 "attempt": attempt_count,
                 "status": status,
                 "url": url,
+                "failure_summary": failure_summary if is_failure else "",
                 "title": title,
                 "load_time_seconds": round(load_time, 2),
                 "success_count": success_count,
@@ -1273,7 +1351,7 @@ def run_probe(stdscr, url, pause_seconds, page_load_timeout, jsonl_path=None, he
             append_jsonl_event(jsonl_path, event_payload)
 
             health_payload = {
-                "heartbeat_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "heartbeat_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "last_event_time": now(),
                 "status": status,
                 "attempt": attempt_count,
@@ -1352,7 +1430,10 @@ def run_self_test(page_load_timeout, health_file):
         ensure_csv_header()
         log_line(f"[{now()}] [{SERVER_NAME}] self-test log write check")
         append_jsonl_event(os.path.join(HOST_ERROR_DIR, "events.selftest.jsonl"), {"ts": now(), "self_test": True})
-        write_health_file(health_file, {"heartbeat_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "self_test": True})
+        write_health_file(
+            health_file,
+            {"heartbeat_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "self_test": True},
+        )
         print(f"[{now()}] OK log/csv/jsonl/health write paths", flush=True)
     except Exception as e:
         failures.append(f"log/csv write check failed: {e}")
